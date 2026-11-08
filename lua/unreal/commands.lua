@@ -91,6 +91,19 @@ local function MakeUnixPath(win_path)
     return unix_path
 end
 
+-- Resolve a path to an absolute path without a trailing slash, so commands
+-- handed to UBT/Build.sh never depend on Neovim's current working directory.
+local function MakeAbsolutePath(path)
+    if not path or path == "" then
+        return path
+    end
+    local abs = vim.fn.fnamemodify(vim.fn.expand(path), ":p")
+    if #abs > 1 then
+        abs = (abs:gsub("/+$", ""))
+    end
+    return abs
+end
+
 local function FuncBind(func, data)
     return function()
         func(data)
@@ -258,7 +271,7 @@ function Commands._EnsureConfigFile(projectRootDir, projectName)
     end
 
     if data then
-        data.EngineDir = MakeUnixPath(data.EngineDir)
+        data.EngineDir = MakeAbsolutePath(MakeUnixPath(data.EngineDir))
 
         -- Configs created by the Windows version of the plugin carry
         -- "PlatformName": "Win64", which UBT rejects on Linux
@@ -283,8 +296,11 @@ function Commands._EnsureConfigFile(projectRootDir, projectName)
 end
 
 function Commands._GetDefaultProjectNameAndDir(filepath)
+    if not filepath or filepath == "" then
+        return nil, nil
+    end
     local uprojectPath, projectDir
-    projectDir, uprojectPath = Commands._find_file_with_extension(filepath, "uproject")
+    projectDir, uprojectPath = Commands._find_file_with_extension(MakeAbsolutePath(filepath), "uproject")
     if not uprojectPath then
         PrintAndLogMessage("Failed to determine project name, could not find the root of the project that contains the .uproject")
         return nil, nil
@@ -337,12 +353,77 @@ local function file_exists(name)
    return false
 end
 
+-- Joins a possibly-relative path onto baseDir and collapses "." / ".."
+-- components. Absolute paths and paths starting with a variable/"~" are
+-- returned unchanged.
+local function ResolvePath(path, baseDir)
+    if path == "" or path:sub(1, 1) == "/" or path:find("^[%$~]") or not baseDir then
+        return path
+    end
+    return vim.fn.simplify(baseDir .. "/" .. path)
+end
+
+-- Flags whose argument is a filesystem path. UBT writes most of these relative
+-- to the compile command's "directory" (Engine/Source), e.g. -I"Runtime/Core/Public",
+-- -isystem"../Extras/...", --sysroot="../Extras/...". Longest prefixes first so
+-- that e.g. -isystem is not mistaken for -I.
+local kPathFlags = {
+    "--sysroot", "-idirafter", "-isysroot", "-isystem", "-imacros",
+    "-include", "-iquote", "-I", "-B", "-F", "-L",
+}
+
+-- Rewrites a single response-file line so any path argument is absolute.
+local function AbsolutizeRspLine(line, baseDir)
+    local indent, rest = line:match("^(%s*)(.-)%s*$")
+    for _, flag in ipairs(kPathFlags) do
+        if rest:sub(1, #flag) == flag then
+            local sep, quote, path = rest:sub(#flag + 1):match('^([=%s]*)("?)(.-)"?$')
+            if path and path ~= "" then
+                return indent .. flag .. sep .. quote .. ResolvePath(path, baseDir) .. quote
+            end
+            return line
+        end
+    end
+    return line
+end
+
+-- Nested response files already rewritten during the current generation run,
+-- keyed by original path. Shared .rsp files are referenced by every compile
+-- unit of a module, so this avoids reprocessing them thousands of times.
+local ProcessedNestedRsps = {}
+
+local ExtractRSP
+
+-- Produces <rsppath>.clang.rsp for a response file included from another one
+-- (e.g. Module.Shared.rsp) and returns its path, or nil if it can't be read.
+local function ProcessNestedRsp(rsppath, baseDir)
+    if ProcessedNestedRsps[rsppath] ~= nil then
+        return ProcessedNestedRsps[rsppath] or nil
+    end
+    ProcessedNestedRsps[rsppath] = false -- guards against include cycles
+
+    local content = ExtractRSP(rsppath, baseDir, true)
+    if not content then
+        return nil
+    end
+    local newpath = rsppath .. ".clang.rsp"
+    local f = io.open(newpath, "w")
+    if not f then
+        return nil
+    end
+    f:write(content)
+    f:close()
+    ProcessedNestedRsps[rsppath] = newpath
+    return newpath
+end
+
 -- On Linux, UnrealBuildTool already emits clang-compatible response files, so
--- unlike the Windows (clang-cl/MSVC) flow no flag translation is needed. We only
+-- unlike the Windows (clang-cl/MSVC) flow no flag translation is needed. We
 -- strip precompiled header usage (clangd cannot consume PCHs built by UE's
--- bundled clang, which is usually a different version) and append a few flags
--- that make clangd friendlier with Unreal code.
-function ExtractRSP(rsppath)
+-- bundled clang, which is usually a different version), rewrite every path
+-- relative to baseDir as an absolute path (recursing into nested @rsp files),
+-- and append a few flags that make clangd friendlier with Unreal code.
+ExtractRSP = function(rsppath, baseDir, isNested)
     local extraFlags = {
         "-Wno-deprecated-enum-enum-conversion",
         "-Wno-deprecated-anon-enum-enum-conversion",
@@ -378,8 +459,20 @@ function ExtractRSP(rsppath)
         end
 
         if not discardLine then
+            local nested = line:match('^%s*@"([^"]+)"%s*$') or line:match("^%s*@(%S+)%s*$")
+            if nested then
+                nested = ResolvePath(nested, baseDir)
+                local newNested = ProcessNestedRsp(nested, baseDir)
+                line = "@\"" .. (newNested or nested) .. "\""
+            else
+                line = AbsolutizeRspLine(line, baseDir)
+            end
             table.insert(lines, line)
         end
+    end
+
+    if isNested then
+        return table.concat(lines, "\n") .. "\n"
     end
 
     for _, incl in ipairs(extraIncludes) do
@@ -489,8 +582,17 @@ function Stage_UbtGenCmd()
     inFile:close()
     coroutine.yield()
 
+    ProcessedNestedRsps = {}
+    local defaultDirectory = CurrentGenData.config.EngineDir .. "/Engine/Source"
+
     for _, entry in ipairs(entries) do
         coroutine.yield()
+        -- compile_commands.json is moved from the engine dir to the project
+        -- dir, so make sure nothing in it depends on where it lives.
+        entry.directory = ResolvePath(entry.directory or defaultDirectory, defaultDirectory)
+        if entry.file then
+            entry.file = ResolvePath(entry.file, entry.directory)
+        end
         local currentFilename = entry.file or ""
 
         logWithVerbosity(kLogLevel_Verbose, "Preparing for LSP symbol parsing: " .. currentFilename)
@@ -516,14 +618,11 @@ function Stage_UbtGenCmd()
         end
 
         if rspToken then
-            local rsppath = rspToken
-            if rsppath:sub(1, 1) ~= "/" and entry.directory then
-                rsppath = entry.directory .. "/" .. rsppath
-            end
+            local rsppath = ResolvePath(rspToken, entry.directory)
 
             local newrsppath = rsppath .. ".clang.rsp"
             if not shouldSkipFile and file_exists(rsppath) then
-                local rspcontent = ExtractRSP(rsppath)
+                local rspcontent = ExtractRSP(rsppath, entry.directory)
                 if rspcontent then
                     local rspfile = io.open(newrsppath, "w")
                     if rspfile then
@@ -961,7 +1060,7 @@ function Commands.SetUnrealCD()
     local current_file_path = vim.api.nvim_buf_get_name(0)
     local prjName, prjDir = Commands._GetDefaultProjectNameAndDir(current_file_path)
     if prjDir then
-        vim.cmd("cd " .. prjDir)
+        vim.cmd("cd " .. vim.fn.fnameescape(prjDir))
     else
         PrintAndLogMessage("Could not find unreal project root directory, make sure you have the correct buffer selected")
     end
