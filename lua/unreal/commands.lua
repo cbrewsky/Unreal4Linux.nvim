@@ -573,10 +573,32 @@ function Stage_UbtGenCmd()
     vim.cmd("Dispatch " .. cmd)
 end
 
+-- Restart the LSP so clangd picks up the new compile_commands.json.
+-- Neovim 0.12+ has the builtin `:lsp restart`; older setups rely on
+-- nvim-lspconfig's `:LspRestart`. Never let this abort the task pipeline.
+local function RestartLsp()
+    local cmd
+    if vim.fn.exists(":lsp") == 2 then
+        cmd = "lsp restart"
+    elseif vim.fn.exists(":LspRestart") == 2 then
+        cmd = "LspRestart"
+    end
+
+    if not cmd then
+        PrintAndLogMessage("No LSP restart command available; restart clangd manually to pick up the new compile_commands.json")
+        return
+    end
+
+    local ok, err = pcall(vim.api.nvim_command, cmd)
+    if not ok then
+        PrintAndLogError("Failed to restart LSP (" .. cmd .. "): " .. tostring(err))
+    end
+end
+
 function Stage_GenHeadersCompleted()
     PrintAndLogMessage("Finished generating header files with Unreal Header Tool...")
     vim.api.nvim_command('autocmd! ShellCmdPost * lua DispatchUnrealnvimCb()')
-    vim.api.nvim_command('LspRestart')
+    RestartLsp()
     Commands.EndTask("headers")
     Commands.EndTask("final")
     Commands:SetCurrentAnimation("kirbyIdle")
