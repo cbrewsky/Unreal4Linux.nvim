@@ -259,6 +259,24 @@ function Commands._EnsureConfigFile(projectRootDir, projectName)
 
     if data then
         data.EngineDir = MakeUnixPath(data.EngineDir)
+
+        -- Configs created by the Windows version of the plugin carry
+        -- "PlatformName": "Win64", which UBT rejects on Linux
+        -- ("Platform Win64 is not a valid platform to build for").
+        -- This fork only builds for Linux, so normalize those entries.
+        local windowsPlatforms = { win64 = true, win32 = true, windows = true }
+        local fixedPlatform = false
+        for _, target in ipairs(data.Targets or {}) do
+            local platform = target.PlatformName
+            if not platform or platform == "" or windowsPlatforms[string.lower(platform)] then
+                target.PlatformName = "Linux"
+                fixedPlatform = true
+            end
+        end
+        if fixedPlatform then
+            PrintAndLogMessage("Some targets in " .. configFilePath ..
+                " use a Windows PlatformName; using \"Linux\" instead. Update the file to silence this message.")
+        end
     end
 
     return data
