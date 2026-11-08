@@ -176,7 +176,6 @@ function Commands._CreateConfigFile(configFilePath, projectName)
     local configContents = [[
 {
     "version" : "0.0.2",
-    "_comment": "dont forget to escape backslashes in EnginePath",    
     "EngineDir": "",
     "Targets":  [
 
@@ -185,42 +184,42 @@ function Commands._CreateConfigFile(configFilePath, projectName)
             "Configuration" : "DebugGame",
             "withEditor" : true,
             "UbtExtraFlags" : "",
-            "PlatformName" : "Win64"
+            "PlatformName" : "Linux"
         },
         {
             "TargetName" : "]] .. projectName .. [[",
             "Configuration" : "DebugGame",
             "withEditor" : false,
             "UbtExtraFlags" : "",
-            "PlatformName" : "Win64"
+            "PlatformName" : "Linux"
         },
         {
             "TargetName" : "]] .. projectName .. [[-Editor",
             "Configuration" : "Development",
             "withEditor" : true,
             "UbtExtraFlags" : "",
-            "PlatformName" : "Win64"
+            "PlatformName" : "Linux"
         },
         {
             "TargetName" : "]] .. projectName .. [[",
             "Configuration" : "Development",
             "withEditor" : false,
             "UbtExtraFlags" : "",
-            "PlatformName" : "Win64"
+            "PlatformName" : "Linux"
         },
         {
             "TargetName" : "]] .. projectName .. [[-Editor",
             "Configuration" : "Shipping",
             "withEditor" : true,
             "UbtExtraFlags" : "",
-            "PlatformName" : "Win64"
+            "PlatformName" : "Linux"
         },
         {
             "TargetName" : "]] .. projectName .. [[",
             "Configuration" : "Shipping",
             "withEditor" : false,
             "UbtExtraFlags" : "",
-            "PlatformName" : "Win64"
+            "PlatformName" : "Linux"
         }
     ]
 }
@@ -320,74 +319,70 @@ local function file_exists(name)
    return false
 end
 
+-- On Linux, UnrealBuildTool already emits clang-compatible response files, so
+-- unlike the Windows (clang-cl/MSVC) flow no flag translation is needed. We only
+-- strip precompiled header usage (clangd cannot consume PCHs built by UE's
+-- bundled clang, which is usually a different version) and append a few flags
+-- that make clangd friendlier with Unreal code.
 function ExtractRSP(rsppath)
-    local extraFlags = "-std=c++20 -Wno-deprecated-enum-enum-conversion -Wno-deprecated-anon-enum-enum-conversion -ferror-limit=0 -Wno-inconsistent-missing-override"
+    local extraFlags = {
+        "-Wno-deprecated-enum-enum-conversion",
+        "-Wno-deprecated-anon-enum-enum-conversion",
+        "-Wno-inconsistent-missing-override",
+        "-ferror-limit=0",
+    }
     local extraIncludes = {
         "Engine/Source/Runtime/CoreUObject/Public/UObject/ObjectMacros.h",
         "Engine/Source/Runtime/Core/Public/Misc/EnumRange.h"
     }
 
-    rsppath = rsppath:gsub("\\\\","/")
     PrintAndLogMessage(rsppath)
 
     if not file_exists(rsppath) then
        PrintAndLogMessage("rsppath doesn't exists: " .. rsppath)
-       return
+       return nil
     end
 
     local lines = {}
-    local isFirstLine = true
-    local lineNb = 0;
+    local skipNext = false
     for line in io.lines(rsppath) do
-        local discardLine = true
+        local discardLine = false
 
-        -- ignored lines
-        if line:find("^/FI") then discardLine = false end
-        if line:find("^/I") then discardLine = false end
-        if line:find("^-W") then discardLine = false end
-
-        line = line:gsub("^/FI", "-include ")
-        line = line:gsub("^(/I )(.*)", "-I \"%2\"")
-
-        if isFirstLine then
-            discardLine = false
+        if skipNext then
+            -- argument of a previous "-include-pch" on its own line
+            discardLine = true
+            skipNext = false
+        elseif line:find("^%s*%-include%-pch%s*$") then
+            discardLine = true
+            skipNext = true
+        elseif line:find("%-include%-pch") or line:find("%.gch") then
+            discardLine = true
         end
 
         if not discardLine then
-            lines[lineNb] = line .. "\n"
-            lineNb = lineNb + 1
+            table.insert(lines, line)
         end
-
-        isFirstLine = false
     end
 
     for _, incl in ipairs(extraIncludes) do
-        lines[lineNb] ="\n" .. "-include \"" .. CurrentGenData.config.EngineDir .. "/" .. incl .. "\""
-        lineNb = lineNb + 1
+        table.insert(lines, "-include \"" .. CurrentGenData.config.EngineDir .. "/" .. incl .. "\"")
     end
-    lines[lineNb] =  "\n" .. extraFlags
-    lineNb = lineNb + 1
-    --table.insert(lines, "\n\"" .. currentFilename .. "\"")
-    return table.concat(lines)
+    for _, flag in ipairs(extraFlags) do
+        table.insert(lines, flag)
+    end
+
+    return table.concat(lines, "\n") .. "\n"
 end
 
-function CreateCommandLine()
-end
-
-function EscapePath(path)
-    -- path = path:gsub("\\", "\\\\")
-    path = path:gsub("\\\\", "/")
-    path = path:gsub("\\", "/")
-    path = path:gsub("\"", "\\\"")
-    return path
-end
 function EnsureDirPath(path)
     PrintAndLogMessage("Ensuring path exists: "..path)
-    -- os.execute("mkdir -p " .. path)
-    local handle = io.popen("cmd.exe /c mkdir \"" .. path.. "\"")
-    handle:flush()
-    local result = handle:read("*a")
-    handle:close()
+    vim.fn.mkdir(path, "p")
+end
+
+-- Returns the response file path referenced by a compile command ("@file" or
+-- "@\"file\""), or nil if the command does not use a response file.
+local function GetRspPathFromCommand(command)
+    return command:match('@"([^"]+)"') or command:match("@'([^']+)'") or command:match("@(%S+)")
 end
 
 local function IsEngineFile(path, start)
@@ -398,7 +393,7 @@ local function IsEngineFile(path, start)
 end
 
 local function IsQuickfixWin(winid)
-    if not vim.api.nvim_win_is_valid(winid) then return false end
+    if not winid or not vim.api.nvim_win_is_valid(winid) then return false end
     local bufnr = vim.api.nvim_win_get_buf(winid)
     local buftype = vim.api.nvim_buf_get_option(bufnr, 'buftype')
 
@@ -423,6 +418,7 @@ Commands.QuickfixWinId = 0
 local function ScrollQF()
     if not IsQuickfixWin(Commands.QuickfixWinId) then
         Commands.QuickfixWinId = GetQuickfixWinId()
+        if not Commands.QuickfixWinId then return end
     end
 
     local qf_list = vim.fn.getqflist()
@@ -447,22 +443,8 @@ function Stage_UbtGenCmd()
     coroutine.yield()
     Commands.BeginTask("gencmd")
     PrintAndLogMessage("callback called!")
-    local outputJsonPath = CurrentGenData.config.EngineDir .. "/compile_commands.json"
+    local file_path = CurrentGenData.config.EngineDir .. "/compile_commands.json"
 
-    local rspdir = CurrentGenData.prjDir .. "/Intermediate/clangRsp/" .. 
-    CurrentGenData.target.PlatformName .. "/" .. 
-    CurrentGenData.target.Configuration .. "/"
-
-    -- all these replaces are slow, could be rewritten as a parser
-    EnsureDirPath(rspdir)
-
-    -- replace bad compiler
-    local file_path = outputJsonPath
-
-    local old_text = "Llvm\\\\x64\\\\bin\\\\clang%-cl%.exe"
-    local new_text = "Llvm/x64/bin/clang++.exe"
-
-    local contentLines = {}
     PrintAndLogMessage("processing compile_commands.json and writing response files")
     PrintAndLogMessage(file_path)
 
@@ -473,114 +455,82 @@ function Stage_UbtGenCmd()
 
     local qflistentry = {text = "Preparing files for parsing." }
     if not skipEngineFiles then
-        qflistentry.text = qflistentry.text .. " Engine source files included, process will take longer" 
+        qflistentry.text = qflistentry.text .. " Engine source files included, process will take longer"
     end
     AppendToQF(qflistentry)
 
-    local currentFilename = ""
-    for line in io.lines(file_path) do
-        local i,j = line:find("\"command")
-        if i then
-            coroutine.yield()
+    local inFile = io.open(file_path, "r")
+    if not inFile then
+        PrintAndLogError("could not open " .. file_path .. ". Did UnrealBuildTool fail? Check the quickfix list.")
+        Commands.EndTask("gencmd")
+        Commands.EndTask("final")
+        DeleteAutocmd(Commands.gencmdAutocmdid)
+        return
+    end
+    local entries = vim.fn.json_decode(inFile:read("*all"))
+    inFile:close()
+    coroutine.yield()
 
-            -- show progress
-            logWithVerbosity(kLogLevel_Verbose, "Preparing for LSP symbol parsing: " .. currentFilename)
-            local isEngineFile = IsEngineFile(currentFilename, CurrentGenData.config.EngineDir)
-            local shouldSkipFile = isEngineFile and skipEngineFiles
+    for _, entry in ipairs(entries) do
+        coroutine.yield()
+        local currentFilename = entry.file or ""
 
-            local qflistentry = {filename = "", lnum = 0, col = 0,
-                text = currentFilename}
-            if not shouldSkipFile then
-                AppendToQF(qflistentry)
+        logWithVerbosity(kLogLevel_Verbose, "Preparing for LSP symbol parsing: " .. currentFilename)
+        local isEngineFile = IsEngineFile(currentFilename, CurrentGenData.config.EngineDir)
+        local shouldSkipFile = isEngineFile and skipEngineFiles
+
+        if not shouldSkipFile then
+            AppendToQF({filename = "", lnum = 0, col = 0, text = currentFilename})
+        end
+
+        -- find the response file this entry uses, if any
+        local rspToken, argIndex
+        if entry.arguments then
+            for idx, arg in ipairs(entry.arguments) do
+                if arg:sub(1, 1) == "@" then
+                    rspToken = arg:sub(2)
+                    argIndex = idx
+                    break
+                end
+            end
+        elseif entry.command then
+            rspToken = GetRspPathFromCommand(entry.command)
+        end
+
+        if rspToken then
+            local rsppath = rspToken
+            if rsppath:sub(1, 1) ~= "/" and entry.directory then
+                rsppath = entry.directory .. "/" .. rsppath
             end
 
-            line = line:gsub(old_text, new_text)
-
-            -- content = content .. "matched:\n"
-            i,j = line:find("%@")
-
-            if i then
-                -- The file name might have an optional \" around to shell escape the file name in the command.
-                local backslashValue = string.byte("\\", 1)
-                if string.byte(line, j+1) == backslashValue then
-                    j = j+2 -- \ and "
-                end
-
-                local _,endpos = line:find("\"", j+1)
-
-                -- same thing here
-                if string.byte(line, endpos-1) == backslashValue then
-                    endpos = endpos-1
-                end
-
-                local rsppath = line:sub(j+1, endpos-1)
-                if rsppath and file_exists(rsppath) then
-                    local newrsppath = rsppath .. ".clang.rsp"
-
-                    -- rewrite rsp contents
-                    if not shouldSkipFile then
-                        local rspfile = io.open(newrsppath, "w")
-                        local rspcontent = ExtractRSP(rsppath)
+            local newrsppath = rsppath .. ".clang.rsp"
+            if not shouldSkipFile and file_exists(rsppath) then
+                local rspcontent = ExtractRSP(rsppath)
+                if rspcontent then
+                    local rspfile = io.open(newrsppath, "w")
+                    if rspfile then
                         rspfile:write(rspcontent)
                         rspfile:close()
                     end
-                    coroutine.yield()
-
-                    table.insert(contentLines, "\t\t\"command\": \"clang++.exe @\\\"" ..newrsppath .."\\\"\",\n")
                 end
-            else
-                -- it's not an rsp command, the flags will be clang compatible
-                -- for some reason they're only incompatible flags inside
-                -- rsps. keep line as is
-                local _, endArgsPos = line:find("%.exe\\\"")
-                local args = line:sub(endArgsPos+1, -1)
-                local rspfilename = currentFilename:gsub("\\\\","/")
-                rspfilename = rspfilename:gsub(":","")
-                rspfilename = rspfilename:gsub("\"","")
-                rspfilename = rspfilename:gsub(",","")
-                rspfilename = rspfilename:gsub("\\","/")
-                rspfilename = rspfilename:gsub("/","_")
-                rspfilename = rspfilename .. ".rsp"
-                local rspfilepath = rspdir .. rspfilename
+            end
 
-                if not shouldSkipFile then
-                    PrintAndLogMessage("Writing rsp: " .. rspfilepath)
-
-                    args = args:gsub("-D\\\"", "-D\"")
-                    args = args:gsub("-I\\\"", "-I\"")
-                    args = args:gsub("\\\"\\\"\\\"", "__3Q_PLACEHOLDER__")
-                    args = args:gsub("\\\"\\\"", "\\\"\"")
-                    args = args:gsub("\\\" ", "\" ")
-                    args = args:gsub("\\\\", "/")
-                    args = args:gsub(",%s*$", "") -- remove trailing comma and spaces
-                    args = args:gsub("\" ", "\"\n") -- one arg per line
-
-                    args = args:gsub("__3Q_PLACEHOLDER__", "\\\"\\\"\"")
-
-                    args = args:gsub("\n[^\n]*$", "")
-                    local rspfile = io.open(rspfilepath, "w")
-                    rspfile:write(args)
-                    rspfile:close()
+            -- point at the cleaned up rsp if we have one (it may exist from a
+            -- previous UnrealGenWithEngine run for skipped engine files)
+            if file_exists(newrsppath) then
+                if argIndex then
+                    entry.arguments[argIndex] = "@" .. newrsppath
+                else
+                    local s, e = entry.command:find(rspToken, 1, true)
+                    entry.command = entry.command:sub(1, s - 1) .. newrsppath .. entry.command:sub(e + 1)
                 end
-                coroutine.yield()
-
-                table.insert(contentLines, "\t\t\"command\": \"clang++.exe @\\\"" .. EscapePath(rspfilepath) .."\\\""
-                    .. " ".. EscapePath(currentFilename) .."\",\n")
             end
-        else
-            local fbegin, fend = line:find("\"file\": ")
-            if fbegin then
-                currentFilename = line:sub(fend+1, -2)
-                logWithVerbosity(kLogLevel_Verbose, "currentfile: " .. currentFilename)
-            end
-            table.insert(contentLines, line .. "\n")
         end
-        ::continue::
     end
 
-
+    coroutine.yield()
     local file = io.open(CurrentCompileCommandsTargetFilePath, "w")
-    file:write(table.concat(contentLines))
+    file:write(vim.fn.json_encode(entries))
     file:flush()
     file:close()
 
@@ -601,7 +551,7 @@ function Stage_UbtGenCmd()
         CurrentGenData.prjName .. CurrentGenData.targetNameSuffix .. " " .. CurrentGenData.target.Configuration .. " " ..
         CurrentGenData.target.PlatformName .. " -headers"
 
-    vim.cmd("compiler msvc")
+    vim.cmd("compiler gcc")
     vim.cmd("Dispatch " .. cmd)
 end
 
@@ -688,8 +638,11 @@ function InitializeCurrentGenData()
         return false
     end
 
-    CurrentGenData.ubtPath = "\"" .. CurrentGenData.config.EngineDir .."/Engine/Binaries/DotNET/UnrealBuildTool/UnrealBuildTool.exe\""
-    CurrentGenData.ueBuildBat = "\"" .. CurrentGenData.config.EngineDir .."/Engine/Build/BatchFiles/Build.bat\""
+    -- Build.sh sets up the engine's bundled dotnet runtime and forwards all of
+    -- its arguments to UnrealBuildTool, so it is used for both UBT modes
+    -- (GenerateClangDatabase, -headers) and regular builds.
+    CurrentGenData.ubtPath = "\"" .. CurrentGenData.config.EngineDir .."/Engine/Build/BatchFiles/Linux/Build.sh\""
+    CurrentGenData.ueBuildBat = CurrentGenData.ubtPath
     CurrentGenData.projectPath = "\"" .. CurrentGenData.prjDir .. "/" .. 
         CurrentGenData.prjName .. ".uproject\""
 
@@ -743,10 +696,11 @@ function Commands.BuildCoroutine()
     local cmd = CurrentGenData.ueBuildBat .. " " .. CurrentGenData.prjName .. 
         CurrentGenData.targetNameSuffix .. " " ..
         CurrentGenData.target.PlatformName  .. " " .. 
-        CurrentGenData.target.Configuration .. " " .. 
-        CurrentGenData.projectPath .. " -waitmutex"
+        CurrentGenData.target.Configuration .. " " ..
+        "-project=" .. CurrentGenData.projectPath .. " " ..
+        CurrentGenData.target.UbtExtraFlags .. " -waitmutex"
 
-    vim.cmd("compiler msvc")
+    vim.cmd("compiler gcc")
     vim.cmd("Dispatch " .. cmd)
 
 end
@@ -786,7 +740,7 @@ function Commands.run(opts)
         end
 
         local executablePath = "\"".. CurrentGenData.config.EngineDir .. "/Engine/Binaries/" ..
-        CurrentGenData.target.PlatformName .. "/UnrealEditor" ..  editorSuffix .. ".exe\""
+        CurrentGenData.target.PlatformName .. "/UnrealEditor" ..  editorSuffix .. "\""
 
         cmd = executablePath .. " " ..
         CurrentGenData.projectPath .. " -skipcompile"
@@ -798,13 +752,13 @@ function Commands.run(opts)
         end
 
         local executablePath = "\"".. CurrentGenData.prjDir .. "/Binaries/" ..
-        CurrentGenData.target.PlatformName .. "/" .. CurrentGenData.prjName ..  exeSuffix .. ".exe\""
+        CurrentGenData.target.PlatformName .. "/" .. CurrentGenData.prjName ..  exeSuffix .. "\""
 
         cmd = executablePath
     end
 
     PrintAndLogMessage(cmd)
-    vim.cmd("compiler msvc")
+    vim.cmd("compiler gcc")
     vim.cmd("Dispatch " .. cmd)
     Commands.EndTask("run")
     Commands.EndTask("final")
@@ -844,8 +798,6 @@ function Commands.generateCommands(opts)
         })
 
     PrintAndLogMessage("listening to ShellCmdPost")
-    --vim.cmd("compiler msvc")
-    PrintAndLogMessage("compiler set to msvc")
 
     Commands.taskCoroutine = coroutine.create(Commands.generateCommandsCoroutine)
     Commands.EnsureUpdateStarted()
@@ -920,9 +872,11 @@ function Commands:LogicUpdate()
     vim.defer_fn(Commands.onStatusUpdate, 1)
 end
 
- local function GetInstallDir()
-    local packer_install_dir = vim.fn.stdpath('data') .. '/site/pack/packer/start/'
-    return packer_install_dir .. "Unreal.nvim//"
+local function GetInstallDir()
+    -- this file lives at <install dir>/lua/unreal/commands.lua; resolve it
+    -- from the script path so it works with any plugin manager / repo name
+    local thisFile = debug.getinfo(1, "S").source:sub(2)
+    return vim.fn.fnamemodify(thisFile, ":p:h:h:h") .. "/"
 end
 
 local mydbg = true
